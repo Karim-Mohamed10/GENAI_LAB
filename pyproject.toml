@@ -1,0 +1,14 @@
+[project]
+name = "lab-genai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dotenv>=0.9.9",
+    "groq>=0.36.0",
+    "loguru>=0.7.3",
+    "pandas>=2.3.3",
+    "playwright>=1.56.0",
+    "pytest-playwright>=0.7.1",
+]
