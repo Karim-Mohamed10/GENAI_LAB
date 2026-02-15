@@ -7,7 +7,7 @@ import os
 from collections import deque
 
 # ==============================================================================
-# 1. FIELD CONNECTIONS & EXACT COORDINATES
+# 1. EXACT FIELD GEOMETRY
 # ==============================================================================
 FIELD_CONNECTIONS = [
     (1, 9), (9, 10), (10, 11), (11, 12), (12, 4),
@@ -37,71 +37,93 @@ STANDARD_FIELD_COORDS = {
 }
 
 # ==============================================================================
-# 2. ENGINES: HOMOGRAPHY & PHYSICS FILTER
+# 2. HOMOGRAPHY ENGINE (NO AVERAGING)
 # ==============================================================================
-class StableHomography:
-    def __init__(self, buffer_size=7):
-        self.buffer = deque(maxlen=buffer_size)
-
-    def validate(self, H):
-        if H is None: return False
-        det = np.linalg.det(H)
-        # Reject degenerate or inverted projections
-        if abs(det) < 1e-6 or det < 0: return False
-        return True
+class ViewTransformer:
+    def __init__(self):
+        self.last_valid_H = None
 
     def update(self, detected_keypoints):
         src_pts, dst_pts = [], []
-        # Use ALL available points to give RANSAC the best chance
-        for kid, (x, y) in detected_keypoints.items():
+        for kid, coords in detected_keypoints.items():
             if kid in STANDARD_FIELD_COORDS:
-                src_pts.append([x, y])
+                src_pts.append(coords)
                 dst_pts.append(STANDARD_FIELD_COORDS[kid])
         
-        if len(src_pts) >= 4:
-            H, _ = cv2.findHomography(np.array(src_pts), np.array(dst_pts), cv2.RANSAC, 5.0)
-            if self.validate(H):
-                self.buffer.append(H)
-        
-        if len(self.buffer) == 0:
-            return None
+        if len(src_pts) < 4:
+            return self.last_valid_H
             
-        # Return smoothed matrix
-        return np.mean(self.buffer, axis=0)
+        src_arr = np.array(src_pts, dtype=np.float32)
+        dst_arr = np.array(dst_pts, dtype=np.float32)
+        
+        # COLLINEARITY GUARD
+        x, y, w, h = cv2.boundingRect(src_arr)
+        if w < 50 or h < 50: 
+            return self.last_valid_H 
+            
+        H, _ = cv2.findHomography(src_arr, dst_arr, cv2.RANSAC, 5.0)
+        
+        if H is not None and abs(np.linalg.det(H)) > 1e-6:
+            self.last_valid_H = H
+            
+        return self.last_valid_H
 
-class PlayerPositionFilter:
-    def __init__(self, max_movement_per_frame=2.0):
-        self.last_positions = {}
-        self.max_movement = max_movement_per_frame # Meters per frame limit
+# ==============================================================================
+# 3. EMA PHYSICS SMOOTHER
+# ==============================================================================
+class PlayerEMAFilter:
+    def __init__(self, alpha=0.3):
+        self.positions = {}
+        self.alpha = alpha
 
     def update(self, track_id, new_pos):
         if new_pos is None:
-            return self.last_positions.get(track_id)
+            return self.positions.get(track_id)
             
-        if track_id not in self.last_positions:
-            self.last_positions[track_id] = new_pos
+        if track_id not in self.positions:
+            self.positions[track_id] = np.array(new_pos, dtype=np.float32)
             return new_pos
             
-        # Check distance between last frame and current calculation
-        dist = np.linalg.norm(np.array(new_pos) - np.array(self.last_positions[track_id]))
+        smoothed = (self.alpha * np.array(new_pos, dtype=np.float32)) + ((1 - self.alpha) * self.positions[track_id])
         
-        if dist > self.max_movement:
-            # Physics violation! Reject the new calculation and keep the old one.
-            return self.last_positions[track_id]
+        dist = np.linalg.norm(smoothed - self.positions[track_id])
+        if dist > 3.0: 
+            return self.positions[track_id]
             
-        self.last_positions[track_id] = new_pos
-        return new_pos
+        self.positions[track_id] = smoothed
+        return smoothed
 
 # ==============================================================================
-# 3. HELPERS & VISUALIZATION
+# 4. HELPERS & VISUALIZATION
 # ==============================================================================
-def get_player_foot_position(bbox):
-    return np.array([(bbox[0]+bbox[2])/2, bbox[3]], dtype=np.float32)
+def get_foot_position(bbox, is_ball=False):
+    x1, y1, x2, y2 = bbox
+    # If it's the ball, track the absolute center of the box
+    if is_ball:
+        return np.array([(x1 + x2) / 2, (y1 + y2) / 2], dtype=np.float32)
+        
+    # If it's a player, anchor to their heels (bottom 5%)
+    height = y2 - y1
+    return np.array([(x1 + x2) / 2, y2 - (height * 0.05)], dtype=np.float32)
 
 def transform_to_field_coords(pos, H):
     if H is None: return None
     pt = np.array([[pos]], dtype=np.float32)
     return cv2.perspectiveTransform(pt, H)[0][0]
+
+def draw_field_lines(frame, keypoints):
+    if not keypoints: return frame
+    
+    # 1. Draw Yellow Lines (BGR: 0, 255, 255)
+    for s, e in FIELD_CONNECTIONS:
+        if s in keypoints and e in keypoints:
+            cv2.line(frame, tuple(map(int, keypoints[s])), tuple(map(int, keypoints[e])), (0, 255, 255), 2)
+            
+    # 2. Draw Green Dots for Keypoints (BGR: 0, 255, 0)
+    for kp_id, coords in keypoints.items():
+        cv2.circle(frame, (int(coords[0]), int(coords[1])), 5, (0, 255, 0), -1)
+        
+    return frame
 
 def draw_minimap(tracks, frame_index):
     m = np.ones((680, 1050, 3), dtype=np.uint8) * 40
@@ -115,28 +137,32 @@ def draw_minimap(tracks, frame_index):
     cv2.rectangle(m, (0, 248), (55, 432), (255, 255, 255), 2)  
     cv2.rectangle(m, (995, 248), (1050, 432), (255, 255, 255), 2) 
 
-    colors = {"players": (0, 255, 0), "goalkeepers": (255, 0, 0), "ball": (255, 255, 255)}
+    # Draw Players and Goalkeepers first
+    colors = {"players": (0, 255, 0), "goalkeepers": (255, 0, 0)}
     for cat, col in colors.items():
         for tid, data in tracks[cat][frame_index].items():
             if data.get("field_pos") is not None:
                 px, py = int(data["field_pos"][0]*scale), int(data["field_pos"][1]*scale)
-                if 0 <= px <= 1050 and 0 <= py <= 680:
-                    cv2.circle(m, (px, py), 8 if cat != "ball" else 5, col, -1)
+                if -50 <= px <= 1100 and -50 <= py <= 730: 
+                    cv2.circle(m, (px, py), 8, col, -1)
+                    
+    # Draw Ball LAST so it sits on top, with a high-visibility style
+    for tid, data in tracks["ball"][frame_index].items():
+        if data.get("field_pos") is not None:
+            px, py = int(data["field_pos"][0]*scale), int(data["field_pos"][1]*scale)
+            if -50 <= px <= 1100 and -50 <= py <= 730:
+                cv2.circle(m, (px, py), 7, (0, 0, 0), -1)        # Bold Black Border
+                cv2.circle(m, (px, py), 4, (255, 255, 255), -1)  # White Fill
+                
     return m
 
 def draw_combined_view(frame, tracks, kpts, f_idx, tracker):
-    # Draw field geometry lines
-    if kpts:
-        for s, e in FIELD_CONNECTIONS:
-            if s in kpts and e in kpts:
-                cv2.line(frame, tuple(map(int, kpts[s])), tuple(map(int, kpts[e])), (0, 0, 0), 2)
+    frame = draw_field_lines(frame, kpts)
 
-    # Draw player bounding boxes
     annotated = tracker.draw_annotations([frame], {
         k: [v[f_idx]] for k, v in tracks.items() if k != "keypoints"
     })[0]
     
-    # Draw coordinate labels
     for cat in ["players", "goalkeepers"]:
         for tid, data in tracks[cat][f_idx].items():
             if data.get("field_pos") is not None:
@@ -147,7 +173,6 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker):
                 cv2.rectangle(annotated, (lx - tw//2 - 2, ly - th - 2), (lx + tw//2 + 2, ly + 2), (0, 0, 0), -1)
                 cv2.putText(annotated, label, (lx - tw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-    # Overlay minimap
     m_map = draw_minimap(tracks, f_idx)
     m_small = cv2.resize(m_map, (350, 227)) 
     h, w = annotated.shape[:2]
@@ -156,7 +181,7 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker):
     return annotated
 
 # ==============================================================================
-# 4. MAIN EXECUTION
+# 5. MAIN EXECUTION
 # ==============================================================================
 def main():
     with VideoProcessor('input_videos/match.mp4') as video:
@@ -176,24 +201,23 @@ def main():
             dets = k_tracker.detect(batch)
             for d in dets: all_kpts.append(k_tracker.track(d))
 
-        homography_engine = StableHomography()
-        
-        # Initialize Physics Filters
-        filters = {c: PlayerPositionFilter(max_movement_per_frame=2.0) for c in ["players", "goalkeepers", "referees"]}
-        filters["ball"] = PlayerPositionFilter(max_movement_per_frame=4.0) # Ball moves faster
+        view_transformer = ViewTransformer()
+        filters = {c: PlayerEMAFilter(alpha=0.25) for c in ["players", "goalkeepers", "referees"]}
+        filters["ball"] = PlayerEMAFilter(alpha=0.6) 
 
         final_tracks = {c: [] for c in ["players", "goalkeepers", "referees", "ball"]}
 
         for f_idx in range(video.total_frames):
-            H = homography_engine.update(all_kpts[f_idx])
+            H = view_transformer.update(all_kpts[f_idx])
 
             for cat in final_tracks:
                 frame_data = {}
                 for tid, d in p_tracks[cat][f_idx].items():
-                    foot = get_player_foot_position(d["bbox"])
+                    # FIX: Pass is_ball parameter to get absolute center for the ball
+                    is_ball = (cat == "ball")
+                    foot = get_foot_position(d["bbox"], is_ball=is_ball)
                     raw_pos = transform_to_field_coords(foot, H)
                     
-                    # Apply the Physics Filter to catch teleports
                     safe_pos = filters[cat].update(tid, raw_pos)
                     
                     frame_data[tid] = {"bbox": d["bbox"], "field_pos": safe_pos}
@@ -203,12 +227,11 @@ def main():
 
         video.reset()
         for f_idx, (_, batch) in enumerate(video.get_batch_generator(batch_size=1)):
-            # Restore the rendering function call!
             annotated_frame = draw_combined_view(batch[0], final_tracks, all_kpts[f_idx], f_idx, p_tracker)
             writer.write(annotated_frame)
 
         writer.release()
-        print("✅ SUCCESS: Physics filters applied and video rendered.")
+        print("✅ SUCCESS: Added yellow lines, green keypoints, and distinct minimap ball!")
 
 if __name__ == '__main__':
     main()
