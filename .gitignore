@@ -1,0 +1,6 @@
+Training/football-players-detection-17/
+tracker/__pycache__/
+runs/detect/
+utils/__pycache__/
+models/
+input videos/
