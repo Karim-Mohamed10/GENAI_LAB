@@ -1,28 +1,6 @@
 import cv2
 import numpy as np
 
-def read_video(video_path):
-    """Legacy function - loads all frames into memory. Use VideoProcessor for large videos."""
-    vid=cv2.VideoCapture(video_path)
-    frames=[]
-    while True:
-        state,frame=vid.read()
-        if not state:
-            break
-        frames.append(frame)
-    return frames
-
-def save_video(video_path, video_frames):
-    if len(video_frames) == 0:
-        return
-    height, width, _ = video_frames[0].shape
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(video_path, fourcc, 30, (width, height))
-    for frame in video_frames:
-        out.write(frame)
-    
-    out.release()
-
 
 class VideoProcessor:
     """Memory-efficient video processor that yields frames instead of loading all at once."""
@@ -47,16 +25,8 @@ class VideoProcessor:
         self.cap.release()
     
     def get_batch_generator(self, batch_size=1):
-        """
-        Generator that yields batches of frames.
-        
-        Args:
-            batch_size: Number of frames per batch
-            
-        Yields:
-            tuple: (batch_index, frames) where frames is a list of numpy arrays
-        """
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
+
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start (if we need to read multiple times)
         
         batch_idx = 0
         while True:
@@ -73,12 +43,11 @@ class VideoProcessor:
             batch_idx += 1
     
     def reset(self):
-        """Reset video to beginning."""
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
 
-class VideoWriter:
-    """Wrapper for cv2.VideoWriter with easier initialization."""
+class VideoWriter: #creator combining the video
+
     
     def __init__(self, output_path, width, height, fps=30):
         self.output_path = output_path

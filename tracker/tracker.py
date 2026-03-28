@@ -17,8 +17,7 @@ class Tracker:
             detections+=batch
         return detections
     
-    def get_object_tracks(self, frames):
-        """Process all frames for object tracking."""
+    def get_object_tracks(self, frames): #to be removed (Karim) the chunked version is more efficient
         detections = self.detect_frames(frames)
         
         tracks={
@@ -67,17 +66,6 @@ class Tracker:
         return tracks
     
     def get_object_tracks_chunked(self, frame_generator, chunk_size=50):
-        """
-        Process frames in chunks to avoid memory issues.
-        Maintains tracking continuity across chunks.
-        
-        Args:
-            frame_generator: Generator that yields frames
-            chunk_size: Number of frames to process at once
-            
-        Returns:
-            tracks dictionary with same structure as get_object_tracks
-        """
         tracks={
             "players":[],
             "goalkeepers":[],
@@ -181,7 +169,9 @@ class Tracker:
         return tracks
     
 
-    def draw_player_indicators(self, frame, player_tracks, color=(0,255,0)):
+    def draw_player_indicators(self, frame, player_tracks, color=(0,255,0), use_team_color=True):
+        # Team colour mapping: team 1 -> red (BGR), team 2 -> blue (BGR)
+        team_colors_map = {1: (0, 0, 255), 2: (255, 0, 0)}
 
         for track_id, player in player_tracks.items():
             bbox = player["bbox"]
@@ -193,12 +183,16 @@ class Tracker:
 
             radius = int(max(x2 - x1, y2 - y1) / 2)
 
-            cv2.circle(frame, (center_x, center_y), radius, color, 2)
+            draw_color = color
+            if use_team_color and "team" in player:
+                draw_color = team_colors_map.get(player["team"], color)
+
+            cv2.circle(frame, (center_x, center_y), radius, draw_color, 2)
 
             cv2.putText(frame, str(track_id),
                         (center_x, center_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, color, 2)
+                        0.6, draw_color, 2)
 
         return frame
 
@@ -213,14 +207,14 @@ class Tracker:
             ball_hashmap = tracks["ball"][frame_index]
             goalkeeper_hashmap = tracks["goalkeepers"][frame_index]
 
-            
-            frame = self.draw_player_indicators(frame, player_hashmap, (0,255,0))
+            # Use team colours for players; goalkeepers always draw in neutral yellow
+            frame = self.draw_player_indicators(frame, player_hashmap, (0,255,0), use_team_color=True)
 
-            frame = self.draw_player_indicators(frame, goalkeeper_hashmap, (255,0,0))
+            frame = self.draw_player_indicators(frame, goalkeeper_hashmap, (0, 255, 255), use_team_color=False)
 
-            frame = self.draw_player_indicators(frame, referee_hashmap, (0,255,255))
+            frame = self.draw_player_indicators(frame, referee_hashmap, (0,255,255), use_team_color=False)
             
-            frame = self.draw_player_indicators(frame, ball_hashmap, (255,255,255))
+            frame = self.draw_player_indicators(frame, ball_hashmap, (255,255,255), use_team_color=False)
 
             output_video_frames.append(frame)
 

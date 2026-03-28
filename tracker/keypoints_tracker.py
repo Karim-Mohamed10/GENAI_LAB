@@ -15,15 +15,15 @@ class KeypointsTracker:
         self.conf = conf
         self.kp_conf = kp_conf
         
-        # Match these to your video and model training size
         self.original_size = (1920, 1080) 
-        self.input_size = 640  # <--- UPDATED to match your Kaggle training
-        
+        self.input_size = 640  #trained model input size
+
+        #scaling factors to convert back to original size
         self.scale_x = self.original_size[0] / self.input_size
         self.scale_y = self.original_size[1] / self.input_size
 
     def detect(self, frames: List[np.ndarray]) -> List[Results]:
-        # Resize to 640 before feeding to the model
+        # predict keypoints on resized frames
         resized_frames = [cv2.resize(f, (self.input_size, self.input_size)) for f in frames]
         return self.model.predict(resized_frames, conf=self.conf)
 

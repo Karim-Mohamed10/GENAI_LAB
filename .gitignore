@@ -3,4 +3,5 @@ tracker/__pycache__/
 runs/detect/
 utils/__pycache__/
 models/
-input videos/
+input_videos/
+output_videos/
