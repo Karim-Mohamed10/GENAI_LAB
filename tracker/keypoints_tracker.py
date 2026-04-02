@@ -6,7 +6,6 @@ from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from typing import List, Dict
 
-
 class KeypointsTracker:
     def __init__(self, model_path: str, conf: float = 0.1, kp_conf: float = 0.7) -> None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -14,21 +13,20 @@ class KeypointsTracker:
         self.model.to(device)
         self.conf = conf
         self.kp_conf = kp_conf
-        
-        self.original_size = (1920, 1080) 
-        self.input_size = 640  #trained model input size
-
-        #scaling factors to convert back to original size
-        self.scale_x = self.original_size[0] / self.input_size
-        self.scale_y = self.original_size[1] / self.input_size
+        self.input_size = 640  # trained model input size
 
     def detect(self, frames: List[np.ndarray]) -> List[Results]:
-        # predict keypoints on resized frames
+        # Predict keypoints on squashed frames to match Roboflow training data
         resized_frames = [cv2.resize(f, (self.input_size, self.input_size)) for f in frames]
-        return self.model.predict(resized_frames, conf=self.conf)
+        results = self.model.predict(resized_frames, conf=self.conf, verbose=False)
+        
+        # Inject the true original frame shapes into the results so track() can scale correctly
+        for res, f in zip(results, frames):
+            res.my_orig_shape = f.shape[:2] # (height, width)
+            
+        return results
 
     def track(self, detection: Results) -> Dict:
-        # standard supervision conversion
         kp_data = sv.KeyPoints.from_ultralytics(detection)
         
         if not kp_data or len(kp_data.xy) == 0:
@@ -37,12 +35,17 @@ class KeypointsTracker:
         xy = kp_data.xy[0] 
         confidence = kp_data.confidence[0]
 
+        # Dynamically scale back based on this specific frame's original size
+        orig_h, orig_w = getattr(detection, 'my_orig_shape', (1080, 1920))
+        scale_x = orig_w / self.input_size
+        scale_y = orig_h / self.input_size
+
         filtered_keypoints = {}
         for i, (coords, conf) in enumerate(zip(xy, confidence)):
             if conf > self.kp_conf:
-                # Scale back to 1920x1080
-                real_x = coords[0] * self.scale_x
-                real_y = coords[1] * self.scale_y
+                # Scale back to the exact original frame dimensions
+                real_x = coords[0] * scale_x
+                real_y = coords[1] * scale_y
                 filtered_keypoints[i] = (real_x, real_y)
 
         return filtered_keypoints

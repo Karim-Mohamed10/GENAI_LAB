@@ -1,6 +1,7 @@
 from sklearn.cluster import KMeans
 from collections import defaultdict, deque
 import numpy as np
+import cv2
 
 
 class TeamAssigner:
@@ -28,47 +29,51 @@ class TeamAssigner:
         return kmeans
 
     def get_player_color(self, frame, bbox):
-        """Extract dominant player color from the top-half of the bounding box."""
+        """Extract dominant player color by masking out the background grass."""
         x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+        h_frame, w_frame = frame.shape[:2]
 
-        # Clamp to frame boundaries
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        # 1. TIGHT CROP (Avoid shorts, hair, and edges)
+        h_box, w_box = y2 - y1, x2 - x1
+        crop_y1 = max(0, y1 + int(h_box * 0.15))
+        crop_y2 = min(h_frame, y1 + int(h_box * 0.55))
+        crop_x1 = max(0, x1 + int(w_box * 0.20))
+        crop_x2 = min(w_frame, x2 - int(w_box * 0.20))
 
-        image = frame[y1:y2, x1:x2]
-
-        # Skip if the crop is too small
-        if image.shape[0] < 4 or image.shape[1] < 4:
+        image_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        if image_crop.shape[0] < 2 or image_crop.shape[1] < 2:
             return None
 
-        top_half_image = image[0:int(image.shape[0] / 2), :]
+        # 2. CONVERT TO HSV (Isolates color from shadows/lighting)
+        hsv_crop = cv2.cvtColor(image_crop, cv2.COLOR_BGR2HSV)
 
-        if top_half_image.shape[0] < 2 or top_half_image.shape[1] < 2:
-            return None
+        # 3. BACKGROUND MASKING (Find all green/grass pixels)
+        # Hue 35 to 85 covers almost all shades of stadium grass
+        lower_green = np.array([35, 40, 40])
+        upper_green = np.array([85, 255, 255])
+        mask_green = cv2.inRange(hsv_crop, lower_green, upper_green)
+        
+        # Invert the mask to get EVERYTHING EXCEPT grass (the player's body)
+        mask_player = cv2.bitwise_not(mask_green)
+        
+        # 4. EXTRACT JERSEY PIXELS
+        player_pixels = image_crop[mask_player == 255]
+        
+        # Fallback: If the mask deleted everything (e.g., player is actually wearing a green jersey)
+        if len(player_pixels) < 10:
+            player_pixels = image_crop.reshape(-1, 3)
 
-        # Get clustering model
-        kmeans = self.get_clustering_model(top_half_image)
-
-        # Get the cluster labels for each pixel
+        # 5. FIND TRUE DOMINANT COLOR
+        # Now we only run KMeans on the pure jersey/skin pixels, totally ignoring the grass
+        kmeans = KMeans(n_clusters=2, init="k-means++", n_init=5, random_state=42)
+        kmeans.fit(player_pixels)
+        
         labels = kmeans.labels_
-
-        # Reshape the labels to the image shape
-        clustered_image = labels.reshape(top_half_image.shape[0], top_half_image.shape[1])
-
-        # Get the player cluster (non-background)
-        corner_clusters = [
-            clustered_image[0, 0],
-            clustered_image[0, -1],
-            clustered_image[-1, 0],
-            clustered_image[-1, -1],
-        ]
-        non_player_cluster = max(set(corner_clusters), key=corner_clusters.count)
-        player_cluster = 1 - non_player_cluster
-
-        player_color = kmeans.cluster_centers_[player_cluster]
-        return player_color
-
+        counts = np.bincount(labels)
+        dominant_cluster = np.argmax(counts)
+        
+        return kmeans.cluster_centers_[dominant_cluster]
+    
     def assign_team_color(self, frame, player_detections):
         """
         Determine the two team colors by clustering the dominant colors

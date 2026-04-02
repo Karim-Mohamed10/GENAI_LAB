@@ -13,7 +13,7 @@ class Tracker:
         batch_size=20
         detections=[]
         for i in range(0,len(frames),batch_size):
-            batch=self.model.predict(frames[i:i+batch_size],conf=0.1,verbose=False, show=False)
+            batch=self.model.predict(frames[i:i+batch_size],conf=0.2,verbose=False, show=False)
             detections+=batch
         return detections
     
@@ -112,12 +112,20 @@ class Tracker:
                         if cls_id == cls_names_inv['goalkeeper']:
                             tracks["goalkeepers"][frame_num][track_id] = {"bbox":bbox}
                         
+                    best_ball_conf = -1
+                    best_ball_bbox = None
                     for frame_detection in detection_supervision:
                         bbox = frame_detection[0].tolist()
+                        conf = frame_detection[2]
                         cls_id = frame_detection[3]
 
                         if cls_id == cls_names_inv['ball']:
-                            tracks["ball"][frame_num][1] = {"bbox":bbox}
+                            if conf > best_ball_conf:
+                                best_ball_conf = conf
+                                best_ball_bbox = bbox
+                    
+                    if best_ball_bbox is not None:
+                        tracks["ball"][frame_num][1] = {"bbox": best_ball_bbox}
                     
                     frame_num += 1
                 
@@ -157,12 +165,20 @@ class Tracker:
                     if cls_id == cls_names_inv['goalkeeper']:
                         tracks["goalkeepers"][frame_num][track_id] = {"bbox":bbox}
                     
+                best_ball_conf = -1
+                best_ball_bbox = None
                 for frame_detection in detection_supervision:
                     bbox = frame_detection[0].tolist()
+                    conf = frame_detection[2]
                     cls_id = frame_detection[3]
 
                     if cls_id == cls_names_inv['ball']:
-                        tracks["ball"][frame_num][1] = {"bbox":bbox}
+                        if conf > best_ball_conf:
+                            best_ball_conf = conf
+                            best_ball_bbox = bbox
+                
+                if best_ball_bbox is not None:
+                    tracks["ball"][frame_num][1] = {"bbox": best_ball_bbox}
                 
                 frame_num += 1
         
@@ -175,24 +191,43 @@ class Tracker:
 
         for track_id, player in player_tracks.items():
             bbox = player["bbox"]
-
             x1, y1, x2, y2 = map(int, bbox)
 
             center_x = int((x1 + x2) / 2)
-            center_y = int((y1 + y2) / 2)
-
-            radius = int(max(x2 - x1, y2 - y1) / 2)
-
+            width = x2 - x1
+            
+            # Determine Team Color
             draw_color = color
             if use_team_color and "team" in player:
                 draw_color = team_colors_map.get(player["team"], color)
 
-            cv2.circle(frame, (center_x, center_y), radius, draw_color, 2)
+            # ---------------------------------------------------------
+            # MODERN DESIGN: 3D Floor Ring (Broadcast Standard)
+            # ---------------------------------------------------------
+            # Create a flattened circle (ellipse) based on player width
+            # Height of ellipse is 1/6th of the width to give a 3D perspective
+            axes = (int(width / 2), int(width / 6)) 
+            center = (center_x, y2) # Anchored exactly at the heels
+            
+            # 1. Draw a thick black shadow/outline first
+            cv2.ellipse(frame, center, axes, 0, 0, 360, (0, 0, 0), 4)
+            # 2. Draw the thinner team-colored ring inside the shadow
+            cv2.ellipse(frame, center, axes, 0, 0, 360, draw_color, 2)
 
-            cv2.putText(frame, str(track_id),
-                        (center_x, center_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, draw_color, 2)
+            # ---------------------------------------------------------
+            # CLEAN ID TAG: Ghost Text Floating Above Head
+            # ---------------------------------------------------------
+            text = str(track_id)
+            
+            # Calculate text size to center it perfectly above the head
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            text_x = center_x - (tw // 2)
+            text_y = y1 - 10 # 10 pixels above the bounding box
+            
+            # Draw thick black text first (acts as an outline/shadow)
+            cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
+            # Draw the bright white text exactly on top
+            cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         return frame
 

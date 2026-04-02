@@ -39,12 +39,30 @@ STANDARD_FIELD_COORDS = { # mapping keypoints to real world coords
 
 
 class ViewTransformer:
-    def __init__(self):
+    def __init__(self, alpha=0.5):
         self.last_valid_H = None
+        self.smoothed_kpts = {}  # Store EMA of keypoints
+        self.alpha = alpha       # Smoothing factor
 
     def update(self, detected_keypoints):
-        src_pts, dst_pts = [], []
+        # 1. Apply EMA smoothing to incoming keypoints
+        smoothed_current = {}
         for kid, coords in detected_keypoints.items():
+            if kid in self.smoothed_kpts:
+                # Blend new coordinates with history
+                smoothed_current[kid] = (
+                    self.alpha * np.array(coords, dtype=np.float32) + 
+                    (1 - self.alpha) * self.smoothed_kpts[kid]
+                )
+            else:
+                smoothed_current[kid] = np.array(coords, dtype=np.float32)
+            
+            # Update history for next frame
+            self.smoothed_kpts[kid] = smoothed_current[kid]
+
+        # 2. Extract source and destination points using the SMOOTHED coordinates
+        src_pts, dst_pts = [], []
+        for kid, coords in smoothed_current.items():
             if kid in STANDARD_FIELD_COORDS:
                 src_pts.append(coords)
                 dst_pts.append(STANDARD_FIELD_COORDS[kid])
@@ -55,11 +73,13 @@ class ViewTransformer:
         src_arr = np.array(src_pts, dtype=np.float32)
         dst_arr = np.array(dst_pts, dtype=np.float32)
         
+        # Check bounding box to ensure points aren't clumped
         x, y, w, h = cv2.boundingRect(src_arr)
         if w < 50 or h < 50: 
             return self.last_valid_H 
             
-        H, _ = cv2.findHomography(src_arr, dst_arr, cv2.RANSAC, 5.0)
+        # 3. Tighten RANSAC threshold from 5.0 to 2.0 to reject perspective outliers
+        H, _ = cv2.findHomography(src_arr, dst_arr, cv2.RANSAC, 2.0)
         
         if H is not None and abs(np.linalg.det(H)) > 1e-6:
             self.last_valid_H = H
@@ -162,34 +182,34 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker, team_colors=None):
         k: [v[f_idx]] for k, v in tracks.items() if k != "keypoints"
     })[0]
     
-    # Draw coordinates
-    for cat in ["players", "goalkeepers", "ball"]:
-        for tid, data in tracks[cat][f_idx].items():
-            if data.get("field_pos") is not None:
-                fx, fy = data["field_pos"]
-                lx, ly = int((data["bbox"][0] + data["bbox"][2]) / 2), int(data["bbox"][1]) - 10
-                label = f"({fx:.1f}, {fy:.1f})m"
+    # # Draw coordinates
+    # for cat in ["players", "goalkeepers", "ball"]:
+    #     for tid, data in tracks[cat][f_idx].items():
+    #         if data.get("field_pos") is not None:
+    #             fx, fy = data["field_pos"]
+    #             lx, ly = int((data["bbox"][0] + data["bbox"][2]) / 2), int(data["bbox"][1]) - 10
+    #             label = f"({fx:.1f}, {fy:.1f})m"
                 
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    #             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                 
-                # Make the ball text white, players cyan
-                txt_color = (255, 255, 255) if cat == "ball" else (0, 255, 255)
+    #             # Make the ball text white, players cyan
+    #             txt_color = (255, 255, 255) if cat == "ball" else (0, 255, 255)
                 
-                cv2.rectangle(annotated, (lx - tw//2 - 2, ly - th - 2), (lx + tw//2 + 2, ly + 2), (0, 0, 0), -1)
-                cv2.putText(annotated, label, (lx - tw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, txt_color, 1)
+    #             cv2.rectangle(annotated, (lx - tw//2 - 2, ly - th - 2), (lx + tw//2 + 2, ly + 2), (0, 0, 0), -1)
+    #             cv2.putText(annotated, label, (lx - tw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, txt_color, 1)
 
-    # Draw speed for players and goalkeepers
-    for cat in ("players", "goalkeepers"):
-        for tid, data in tracks[cat][f_idx].items():
-            spd = data.get("speed")
-            if spd is None or data.get("bbox") is None:
-                continue
-            lx = int((data["bbox"][0] + data["bbox"][2]) / 2)
-            ly = int(data["bbox"][1]) - 26
-            spd_label = f"{spd:.1f} km/h"
-            (sw, sh), _ = cv2.getTextSize(spd_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            cv2.rectangle(annotated, (lx - sw//2 - 2, ly - sh - 2), (lx + sw//2 + 2, ly + 2), (0, 0, 0), -1)
-            cv2.putText(annotated, spd_label, (lx - sw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
+    # # Draw speed for players and goalkeepers
+    # for cat in ("players", "goalkeepers"):
+    #     for tid, data in tracks[cat][f_idx].items():
+    #         spd = data.get("speed")
+    #         if spd is None or data.get("bbox") is None:
+    #             continue
+    #         lx = int((data["bbox"][0] + data["bbox"][2]) / 2)
+    #         ly = int(data["bbox"][1]) - 26
+    #         spd_label = f"{spd:.1f} km/h"
+    #         (sw, sh), _ = cv2.getTextSize(spd_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    #         cv2.rectangle(annotated, (lx - sw//2 - 2, ly - sh - 2), (lx + sw//2 + 2, ly + 2), (0, 0, 0), -1)
+    #         cv2.putText(annotated, spd_label, (lx - sw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
 
     m_map = draw_minimap(tracks, f_idx, team_colors)
 
@@ -207,7 +227,7 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker, team_colors=None):
 
 
 def main():
-    with VideoProcessor('input_videos/match.mp4') as video:
+    with VideoProcessor('input_videos/LIVvsCHE.mp4') as video:
         p_tracker = Tracker('models/best.pt')
         k_tracker = KeypointsTracker('models/Keypoints_detection_best.pt', conf=0.3, kp_conf=0.5)
 
@@ -239,10 +259,7 @@ def main():
             frame = batch[0]
             player_dets = p_tracks["players"][batch_idx]
             for _, det in player_dets.items():
-                # Isolate the jersey by using only the upper half of the bounding box
-                x1, y1, x2, y2 = det["bbox"]
-                upper_bbox = [int(x1), int(y1), int(x2), int(y1 + (y2 - y1) / 2)]
-                color = team_assigner.get_player_color(frame, upper_bbox)
+                color = team_assigner.get_player_color(frame, det["bbox"])
                 if color is not None:
                     all_player_colors.append(color)
 
@@ -254,7 +271,7 @@ def main():
         else:
             print("WARNING: Could not initialize team assignment - not enough player detections")
 
-        view_transformer = ViewTransformer()
+        view_transformer = ViewTransformer(alpha=0.5)
         possession_tracker = PossessionTracker(possession_radius=3.0, smoothing_window=5)
         # field_pos is already in real-world metres so scale factors = 1.0
         speed_estimator = SpeedEstimator(field_width=105, field_height=68,
@@ -272,6 +289,8 @@ def main():
         video.reset()
         frame_iter = iter(video.get_batch_generator(batch_size=1))
 
+        KNOWN_MARKS = [(11.0, 34.0), (94.0, 34.0), (52.5, 34.0)] # penalty spots and center
+
         for f_idx in range(video.total_frames):
             # Get the current frame for colour-based team assignment
             _, cur_batch = next(frame_iter)
@@ -281,22 +300,33 @@ def main():
 
             for cat in final_tracks:
                 frame_data = {}
-                for tid, d in p_tracks[cat][f_idx].items():
+                # Using list() to create a copy for safe iteration while deleting
+                for tid, d in list(p_tracks[cat][f_idx].items()):
                     is_ball = (cat == "ball")
                     foot = get_foot_position(d["bbox"], is_ball=is_ball)
                     raw_pos = transform_to_field_coords(foot, H)
-                    
+
+                    # --- Exclusion Zone Filter for Ball ---
+                    if cat == "ball" and raw_pos is not None:
+                        is_false_positive = False
+                        for mark in KNOWN_MARKS:
+                            dist = np.linalg.norm(np.array(raw_pos) - np.array(mark))
+                            if dist < 3.0:
+                                is_false_positive = True
+                                break
+                        
+                        if is_false_positive:
+                            raw_pos = None # Reject this position
+                            p_tracks["ball"][f_idx].pop(tid, None) # Remove from drawable tracks
+                            continue # Skip adding to final_tracks for this frame
+
                     safe_pos = filters[cat].update(tid, raw_pos)
                     
                     entry = {"bbox": d["bbox"], "field_pos": safe_pos}
 
                     # Assign team for players only (goalkeepers keep default colour)
                     if cat == "players" and team_assigner.kmeans is not None:
-                        x1, y1, x2, y2 = d["bbox"]
-                        w, h = x2 - x1, y2 - y1
-                        # Tight crop on the core torso
-                        jersey_bbox = [int(x1 + w * 0.3), int(y1 + h * 0.2), int(x2 - w * 0.3), int(y1 + h * 0.5)]
-                        team_id = team_assigner.get_player_team(cur_frame, jersey_bbox, tid)
+                        team_id = team_assigner.get_player_team(cur_frame, d["bbox"], tid)
                         entry["team"] = team_id
 
                     # Hardcoded goalkeeper team assignments
@@ -324,7 +354,7 @@ def main():
                 break
             possession_tracker.update(ball_pos, final_tracks["players"][-1])
 
-        writer = VideoWriter('output_videos/full_tracking_isa.mp4', video.width, video.height, video.fps)
+        writer = VideoWriter('output_videos/KEY_LIVvsCHE.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
