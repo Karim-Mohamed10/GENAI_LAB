@@ -4,10 +4,12 @@ from tracker.keypoints_tracker import KeypointsTracker
 from TeamFeatures.team_assigner import TeamAssigner
 from TeamFeatures.possession_tracker import PossessionTracker
 from TeamFeatures.speed_estimator import SpeedEstimator
+from TeamFeatures.pass_detector import PassDetector
 import cv2
 import numpy as np
 import imageio
 import os
+import json
 
 #connecting keypoints 
 FIELD_CONNECTIONS = [
@@ -41,15 +43,15 @@ STANDARD_FIELD_COORDS = { # mapping keypoints to real world coords
 class ViewTransformer:
     def __init__(self, alpha=0.5):
         self.last_valid_H = None
-        self.smoothed_kpts = {}  # Store EMA of keypoints
-        self.alpha = alpha       # Smoothing factor
+        self.smoothed_kpts = {}  
+        self.alpha = alpha      
 
     def update(self, detected_keypoints):
-        # 1. Apply EMA smoothing to incoming keypoints
+        
         smoothed_current = {}
         for kid, coords in detected_keypoints.items():
             if kid in self.smoothed_kpts:
-                # Blend new coordinates with history
+               
                 smoothed_current[kid] = (
                     self.alpha * np.array(coords, dtype=np.float32) + 
                     (1 - self.alpha) * self.smoothed_kpts[kid]
@@ -57,10 +59,8 @@ class ViewTransformer:
             else:
                 smoothed_current[kid] = np.array(coords, dtype=np.float32)
             
-            # Update history for next frame
             self.smoothed_kpts[kid] = smoothed_current[kid]
 
-        # 2. Extract source and destination points using the SMOOTHED coordinates
         src_pts, dst_pts = [], []
         for kid, coords in smoothed_current.items():
             if kid in STANDARD_FIELD_COORDS:
@@ -73,12 +73,10 @@ class ViewTransformer:
         src_arr = np.array(src_pts, dtype=np.float32)
         dst_arr = np.array(dst_pts, dtype=np.float32)
         
-        # Check bounding box to ensure points aren't clumped
         x, y, w, h = cv2.boundingRect(src_arr)
         if w < 50 or h < 50: 
             return self.last_valid_H 
             
-        # 3. Tighten RANSAC threshold from 5.0 to 2.0 to reject perspective outliers
         H, _ = cv2.findHomography(src_arr, dst_arr, cv2.RANSAC, 2.0)
         
         if H is not None and abs(np.linalg.det(H)) > 1e-6:
@@ -91,7 +89,6 @@ class PlayerEMAFilter:
     def __init__(self, alpha=0.3, max_dist=3.0):
         self.positions = {}
         self.alpha = alpha
-        # FIXED: Added configurable max distance so the ball isn't restricted
         self.max_dist = max_dist 
 
     def update(self, track_id, new_pos):
@@ -227,7 +224,7 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker, team_colors=None):
 
 
 def main():
-    with VideoProcessor('input_videos/LIVvsCHE.mp4') as video:
+    with VideoProcessor('input_videos/CHEvsMCI.mp4') as video:
         p_tracker = Tracker('models/best.pt')
         k_tracker = KeypointsTracker('models/Keypoints_detection_best.pt', conf=0.3, kp_conf=0.5)
 
@@ -291,6 +288,9 @@ def main():
 
         KNOWN_MARKS = [(11.0, 34.0), (94.0, 34.0), (52.5, 34.0)] # penalty spots and center
 
+        pass_detector = PassDetector()
+        match_passes = []
+
         for f_idx in range(video.total_frames):
             # Get the current frame for colour-based team assignment
             _, cur_batch = next(frame_iter)
@@ -347,14 +347,26 @@ def main():
                 f_idx, video.fps
             )
 
-            # --- Possession update for this frame ---
+            # --- Extract ball info ---
             ball_pos = None
+            ball_speed = None
             for _, bd in final_tracks["ball"][-1].items():
                 ball_pos = bd.get("field_pos")
+                ball_speed = bd.get("speed")
                 break
+
+            # --- Pass detection for this frame ---
+            pass_event = pass_detector.update(
+                ball_pos, ball_speed, final_tracks["players"][-1], f_idx, video.fps
+            )
+            if pass_event is not None:
+                match_passes.append(pass_event)
+                print(f"SUCCESS: Pass event detected: {pass_event}")
+
+            # --- Possession update for this frame ---
             possession_tracker.update(ball_pos, final_tracks["players"][-1])
 
-        writer = VideoWriter('output_videos/KEY_LIVvsCHE.mp4', video.width, video.height, video.fps)
+        writer = VideoWriter('output_videos/CHEvsMCIpass.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
@@ -374,6 +386,11 @@ def main():
             writer.write(annotated_frame)
 
         writer.release()
+        
+        # --- Save Passes to JSON ---
+        with open('passes.json', 'w') as f:
+            json.dump(match_passes, f, indent=4)
+        print(f"Successfully saved {len(match_passes)} pass events to passes.json")
 
         t1_pct, t2_pct = possession_tracker.get_possession_percentages()
         print(f"SUCCESS: Ball now tracks properly on minimap and displays coordinates!")
