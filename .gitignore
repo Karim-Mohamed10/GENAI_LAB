@@ -6,3 +6,4 @@ models/
 input_videos/
 output_videos/
 TeamFeatures/__pycache__/
+passes.json

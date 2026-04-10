@@ -64,7 +64,9 @@ class SpeedEstimator:
                         speed = (distance / time_diff) * 3.6 if time_diff > 0 else 0.0
 
                         # Apply maximum speed check
-                        speed = min(speed, self.max_speed)
+                        # Apply maximum speed check (allow the ball to go much faster than humans)
+                        current_max = 150.0 if track_type == "ball" else self.max_speed
+                        speed = min(speed, current_max)
 
                         # Apply smoothing
                         smoothed_speed = self._smooth_speed(player_id, speed)

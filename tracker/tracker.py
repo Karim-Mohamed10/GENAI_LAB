@@ -245,7 +245,7 @@ class Tracker:
             # Use team colours for players; goalkeepers always draw in neutral yellow
             frame = self.draw_player_indicators(frame, player_hashmap, (0,255,0), use_team_color=True)
 
-            frame = self.draw_player_indicators(frame, goalkeeper_hashmap, (0, 255, 255), use_team_color=False)
+            frame = self.draw_player_indicators(frame, goalkeeper_hashmap, (0, 255, 0), use_team_color=False)
 
             frame = self.draw_player_indicators(frame, referee_hashmap, (0,255,255), use_team_color=False)
             

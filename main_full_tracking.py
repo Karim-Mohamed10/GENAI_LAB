@@ -5,11 +5,13 @@ from TeamFeatures.team_assigner import TeamAssigner
 from TeamFeatures.possession_tracker import PossessionTracker
 from TeamFeatures.speed_estimator import SpeedEstimator
 from TeamFeatures.pass_detector import PassDetector
+from TeamFeatures.goalkeeper_detector import GoalkeeperDetector
 import cv2
 import numpy as np
 import imageio
 import os
 import json
+import draw_pass_maps
 
 #connecting keypoints 
 FIELD_CONNECTIONS = [
@@ -153,16 +155,25 @@ def draw_minimap(tracks, frame_index, team_colors_map=None):
             px, py = int(data["field_pos"][0]*scale), int(data["field_pos"][1]*scale)
             if -50 <= px <= 1100 and -50 <= py <= 730:
                 t_id = data.get("team", 1)
-                col = team_colors_map.get(t_id, (0, 255, 0))
+                
+                if data.get("has_ball"):
+                    col = (255, 0, 255) # Magenta in BGR
+                else:
+                    col = team_colors_map.get(t_id, (0, 255, 0))
+                
                 cv2.circle(m, (px, py), 12, col, -1)
-    # Goalkeepers – default colour (yellow) with white border, no team colour
+                
+                # Add a white ring for extra visibility
+                if data.get("has_ball"):
+                    cv2.circle(m, (px, py), 16, (255, 255, 255), 2)
+    # Goalkeepers – default colour (green) with white border, no team colour
     for tid, data in tracks["goalkeepers"][frame_index].items():
         if data.get("field_pos") is not None:
             px, py = int(data["field_pos"][0]*scale), int(data["field_pos"][1]*scale)
             if -50 <= px <= 1100 and -50 <= py <= 730:
                 cv2.circle(m, (px, py), 14, (255, 255, 255), -1)
-                cv2.circle(m, (px, py), 12, (0, 255, 255), -1)
-                    
+                cv2.circle(m, (px, py), 12, (0, 255, 0), -1)
+
     for tid, data in tracks["ball"][frame_index].items():
         if data.get("field_pos") is not None:
             px, py = int(data["field_pos"][0]*scale), int(data["field_pos"][1]*scale)
@@ -179,6 +190,13 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker, team_colors=None):
         k: [v[f_idx]] for k, v in tracks.items() if k != "keypoints"
     })[0]
     
+    # --- DEBUG: Highlight player with the ball ---
+    for tid, data in tracks["players"][f_idx].items():
+        if data.get("has_ball") and data.get("bbox") is not None:
+            x1, y1, x2, y2 = [int(v) for v in data["bbox"]]
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 255), 4)
+            cv2.putText(annotated, f"BALL (P{tid})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+
     # # Draw coordinates
     # for cat in ["players", "goalkeepers", "ball"]:
     #     for tid, data in tracks[cat][f_idx].items():
@@ -282,13 +300,13 @@ def main():
         final_tracks = {c: [] for c in ["players", "goalkeepers", "referees", "ball"]}
 
         # We need the actual video frames for team colour extraction
-        GK_TEAM_MAP = {100: 1, 469: 2}  # hardcoded goalkeeper → team assignments
         video.reset()
         frame_iter = iter(video.get_batch_generator(batch_size=1))
 
         KNOWN_MARKS = [(11.0, 34.0), (94.0, 34.0), (52.5, 34.0)] # penalty spots and center
 
         pass_detector = PassDetector()
+        gk_detector = GoalkeeperDetector()
         match_passes = []
 
         for f_idx in range(video.total_frames):
@@ -297,6 +315,17 @@ def main():
             cur_frame = cur_batch[0]
 
             H = view_transformer.update(all_kpts[f_idx])
+
+            # --- Extract Goalkeepers dynamically ---
+            extracted_gks = gk_detector.separate_goalkeepers(
+                p_tracks["players"][f_idx], 
+                H, 
+                get_foot_position, 
+                transform_to_field_coords
+            )
+            # Add them safely to the goalkeepers track dictionary
+            if extracted_gks:
+                p_tracks["goalkeepers"][f_idx].update(extracted_gks)
 
             for cat in final_tracks:
                 frame_data = {}
@@ -329,12 +358,8 @@ def main():
                         team_id = team_assigner.get_player_team(cur_frame, d["bbox"], tid)
                         entry["team"] = team_id
 
-                    # Hardcoded goalkeeper team assignments
-                    if cat == "goalkeepers" and tid in GK_TEAM_MAP:
-                        entry["team"] = GK_TEAM_MAP[tid]
-
                     # Provide projection (metres) for speed estimation
-                    if safe_pos is not None and cat in ("players", "goalkeepers"):
+                    if safe_pos is not None and cat in ("players", "goalkeepers", "ball"):
                         entry["projection"] = (float(safe_pos[0]), float(safe_pos[1]))
 
                     frame_data[tid] = entry
@@ -343,7 +368,8 @@ def main():
             # --- Speed estimation for this frame ---
             speed_estimator.calculate_speed(
                 {"players": final_tracks["players"][-1],
-                 "goalkeepers": final_tracks["goalkeepers"][-1]},
+                 "goalkeepers": final_tracks["goalkeepers"][-1],
+                 "ball": final_tracks["ball"][-1]},
                 f_idx, video.fps
             )
 
@@ -359,6 +385,13 @@ def main():
             pass_event = pass_detector.update(
                 ball_pos, ball_speed, final_tracks["players"][-1], f_idx, video.fps
             )
+
+            # --- DEBUG: Tag the player the system thinks has the ball ---
+            if ball_pos is not None:
+                closest_id, _, best_dist = pass_detector._get_closest_player(ball_pos, final_tracks["players"][-1])
+                if closest_id is not None and best_dist <= pass_detector.possession_radius:
+                    if closest_id in final_tracks["players"][-1]:
+                        final_tracks["players"][-1][closest_id]["has_ball"] = True
             if pass_event is not None:
                 match_passes.append(pass_event)
                 print(f"SUCCESS: Pass event detected: {pass_event}")
@@ -366,7 +399,7 @@ def main():
             # --- Possession update for this frame ---
             possession_tracker.update(ball_pos, final_tracks["players"][-1])
 
-        writer = VideoWriter('output_videos/CHEvsMCIpass.mp4', video.width, video.height, video.fps)
+        writer = VideoWriter('output_videos/CHEvsMCItest.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
@@ -383,6 +416,24 @@ def main():
             annotated_frame = possession_tracker.draw_possession_bar_at(
                 annotated_frame, f_idx, team_colors=poss_colors
             )
+
+            # --- DEBUG: Pass Visualization Overlay ---
+            active_pass = None
+            for p in match_passes:
+                start_f = p.get("start_frame", 0)
+                end_f = p.get("end_frame", 0)
+                if start_f <= f_idx <= end_f + int(video.fps * 1.5):
+                    active_pass = p
+                    break
+            
+            if active_pass:
+                text = f"{active_pass['status']} PASS: P{active_pass['initiator_id']} -> P{active_pass['receiver_id']}"
+                bg_color = (0, 0, 0)
+                text_color = (0, 255, 0) if active_pass['status'] == "COMPLETED" else (0, 0, 255)
+                
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                cv2.rectangle(annotated_frame, (40, 40), (40 + tw + 20, 40 + th + 30), bg_color, -1)
+                cv2.putText(annotated_frame, text, (50, 40 + th + 15), cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
             writer.write(annotated_frame)
 
         writer.release()
@@ -395,6 +446,10 @@ def main():
         t1_pct, t2_pct = possession_tracker.get_possession_percentages()
         print(f"SUCCESS: Ball now tracks properly on minimap and displays coordinates!")
         print(f"Final Possession  —  Team 1: {t1_pct}%  |  Team 2: {t2_pct}%")
+        
+        # --- Generate Pass Maps ---
+        print("Generating pass maps")
+        draw_pass_maps.main()
 
 if __name__ == '__main__':
     main()

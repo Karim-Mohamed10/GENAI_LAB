@@ -1,7 +1,7 @@
 import math
 
 class PassDetector:
-    def __init__(self, possession_radius=2.0, kick_speed_threshold=15.0, min_possession_frames=3):
+    def __init__(self, possession_radius=1.5, kick_speed_threshold=10.0, min_possession_frames=1):
         self.possession_radius = possession_radius
         self.kick_speed_threshold = kick_speed_threshold
         self.min_possession_frames = min_possession_frames
@@ -74,11 +74,13 @@ class PassDetector:
                 self.possession_frames = 0
 
         elif self.state == "MOTION":
-            if ball_speed is not None and ball_speed < self.kick_speed_threshold and best_dist <= self.possession_radius:
+            
+            # FIX 1: Pass received by a DIFFERENT player (Catches one-touch and fast passes)
+            if best_dist <= self.possession_radius and closest_id is not None and closest_id != self.initiator_id:
                 status = "COMPLETED" if closest_team == self.initiator_team else "INTERCEPTED"
                 
                 distance_meters = 0.0
-                if self.pass_start_pos and ball_pos:
+                if self.pass_start_pos is not None and ball_pos is not None:
                     distance_meters = math.hypot(ball_pos[0] - self.pass_start_pos[0], ball_pos[1] - self.pass_start_pos[1])
                 
                 duration_seconds = 0.0
@@ -88,14 +90,16 @@ class PassDetector:
                 event = {
                     "event_type": "PASS",
                     "status": status,
-                    "initiator_id": self.initiator_id,
-                    "initiator_team": self.initiator_team,
-                    "receiver_id": closest_id,
-                    "receiver_team": closest_team,
-                    "start_pos": self.pass_start_pos,
-                    "end_pos": ball_pos,
-                    "distance_meters": distance_meters,
-                    "duration_seconds": duration_seconds
+                    "initiator_id": int(self.initiator_id) if self.initiator_id is not None else None,
+                    "initiator_team": int(self.initiator_team) if self.initiator_team is not None else None,
+                    "receiver_id": int(closest_id) if closest_id is not None else None,
+                    "receiver_team": int(closest_team) if closest_team is not None else None,
+                    "start_pos": [float(x) for x in self.pass_start_pos] if self.pass_start_pos is not None else None,
+                    "end_pos": [float(x) for x in ball_pos] if ball_pos is not None else None,
+                    "distance_meters": round(float(distance_meters), 2),
+                    "duration_seconds": round(float(duration_seconds), 2),
+                    "start_frame": int(self.pass_start_frame) if self.pass_start_frame is not None else None,
+                    "end_frame": int(frame_idx)
                 }
 
                 self.state = "POSSESSION"
@@ -105,4 +109,13 @@ class PassDetector:
                 
                 return event
 
+            # FIX 2: Player passes to himself / Knock-on dribble (Silently reset)
+            elif best_dist <= self.possession_radius and closest_id == self.initiator_id and ball_speed is not None and ball_speed < self.kick_speed_threshold:
+                self.state = "POSSESSION"
+                self.current_possessor = closest_id
+                self.current_team = closest_team
+                self.possession_frames = 1
+                return None
+
         return None
+
