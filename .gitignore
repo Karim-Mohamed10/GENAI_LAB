@@ -6,4 +6,10 @@ models/
 input_videos/
 output_videos/
 TeamFeatures/__pycache__/
+data/
+Exports/
+.vscode/
+__pycache__/
+runs/
+
 passes.json
