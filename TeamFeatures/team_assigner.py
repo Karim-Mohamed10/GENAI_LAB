@@ -48,8 +48,8 @@ class TeamAssigner:
         hsv_crop = cv2.cvtColor(image_crop, cv2.COLOR_BGR2HSV)
 
         # 3. BACKGROUND MASKING (Remove Grass)
-        lower_green = np.array([35, 40, 40])
-        upper_green = np.array([85, 255, 255])
+        lower_green = np.array([25, 30, 30]) 
+        upper_green = np.array([100, 255, 255])
         mask_green = cv2.inRange(hsv_crop, lower_green, upper_green)
         mask_player = cv2.bitwise_not(mask_green)
         

@@ -1,7 +1,7 @@
 import math
 
 class PassDetector:
-    def __init__(self, possession_radius=1.5, kick_speed_threshold=10.0, min_possession_frames=1):
+    def __init__(self, possession_radius=1.5, kick_speed_threshold=10.0, min_possession_frames=2):
         self.possession_radius = possession_radius
         self.kick_speed_threshold = kick_speed_threshold
         self.min_possession_frames = min_possession_frames

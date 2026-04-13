@@ -172,8 +172,9 @@ class Tracker:
                     conf = frame_detection[2]
                     cls_id = frame_detection[3]
 
-                    if cls_id == cls_names_inv['ball']:
-                        if conf > best_ball_conf:
+                    if cls_id in cls_names_inv['ball']:
+                        # Add a strict 40% confidence floor to ignore shoes/socks!
+                        if conf > best_ball_conf and conf > 0.4: 
                             best_ball_conf = conf
                             best_ball_bbox = bbox
                 

@@ -1,3 +1,5 @@
+import torch
+import ultralytics
 from utils.video import VideoProcessor, VideoWriter
 from tracker.tracker import Tracker
 from tracker.keypoints_tracker import KeypointsTracker
@@ -447,7 +449,7 @@ def main():
             print("WARNING: Team colors were not initialized")
 
         view_transformer = ViewTransformer(alpha=0.5)
-        possession_tracker = PossessionTracker(possession_radius=3.0, smoothing_window=5)
+        possession_tracker = PossessionTracker(possession_radius=1.2, smoothing_window=5)
         # field_pos is already in real-world metres so scale factors = 1.0
         speed_estimator = SpeedEstimator(field_width=105, field_height=68,
                                          real_field_length=105.0, real_field_width=68.0,
@@ -455,7 +457,7 @@ def main():
 
         # FIXED: Give the players a 3.0m speed limit, but give the ball an infinite (100.0m) limit so it never freezes
         filters = {c: PlayerEMAFilter(alpha=0.25, max_dist=3.0) for c in ["players", "goalkeepers", "referees"]}
-        filters["ball"] = PlayerEMAFilter(alpha=0.8, max_dist=100.0) 
+        filters["ball"] = PlayerEMAFilter(alpha=1, max_dist=100.0) 
 
         final_tracks = {c: [] for c in ["players", "goalkeepers", "referees", "ball"]}
 
@@ -515,15 +517,8 @@ def main():
                             p_tracks["ball"][f_idx].pop(tid, None) # Remove from drawable tracks
                             continue # Skip adding to final_tracks for this frame
 
-                    if raw_pos is not None:
-                        adjusted_raw_pos = np.array(
-                            [raw_pos[0] - camera_shift[0], raw_pos[1] - camera_shift[1]],
-                            dtype=np.float32,
-                        )
-                    else:
-                        adjusted_raw_pos = None
-
-                    safe_pos = filters[cat].update(tid, adjusted_raw_pos)
+                    # No need to adjust with optical flow pixel shifts.
+                    safe_pos = filters[cat].update(tid, raw_pos)
                     
                     entry = {"bbox": d["bbox"], "field_pos": safe_pos}
 
@@ -619,7 +614,7 @@ def main():
                     f"(Team {event.get('team')})"
                 )
 
-        writer = VideoWriter('output_videos/LIVvsRMAtest.mp4', video.width, video.height, video.fps)
+        writer = VideoWriter('output_videos/LIVvsRMAnew.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
