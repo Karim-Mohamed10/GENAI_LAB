@@ -1,16 +1,21 @@
 from utils.video import VideoProcessor, VideoWriter
 from tracker.tracker import Tracker
 from tracker.keypoints_tracker import KeypointsTracker
+from Camera_estimator.Cam_Estimator import Cam_Estimator
 from TeamFeatures.team_assigner import TeamAssigner
+from TeamFeatures.caeAssigner import CAETeamAssigner
 from TeamFeatures.possession_tracker import PossessionTracker
 from TeamFeatures.speed_estimator import SpeedEstimator
 from TeamFeatures.pass_detector import PassDetector
 from TeamFeatures.goalkeeper_detector import GoalkeeperDetector
+from TeamFeatures.tackle_detector import TackleDetector
+from TeamFeatures.Card_Detector import CardDetector
 import cv2
 import numpy as np
 import imageio
 import os
 import json
+import sys
 import draw_pass_maps
 
 #connecting keypoints 
@@ -241,50 +246,205 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker, team_colors=None):
     return annotated
 
 
+def get_closest_player_id(ball_position, players_frame, team_id):
+    if ball_position is None or team_id not in (1, 2):
+        return None
+
+    closest_player_id = None
+    closest_distance = float("inf")
+    ball_point = np.array(ball_position, dtype=np.float32)
+
+    for player_id, player_data in players_frame.items():
+        if player_data.get("team") != team_id:
+            continue
+        player_position = player_data.get("field_pos")
+        if player_position is None:
+            continue
+
+        distance = float(np.linalg.norm(np.array(player_position, dtype=np.float32) - ball_point))
+        if distance < closest_distance:
+            closest_distance = distance
+            closest_player_id = player_id
+
+    return closest_player_id
+
+
+def get_ball_possessor(ball_position, players_frame, max_possession_distance=2.3):
+    if ball_position is None:
+        return None, None
+
+    ball_point = np.array(ball_position, dtype=np.float32)
+    best_id = None
+    best_team = None
+    best_dist = float("inf")
+
+    for player_id, player_data in players_frame.items():
+        pos = player_data.get("field_pos")
+        team = player_data.get("team")
+        if pos is None or team not in (1, 2):
+            continue
+
+        dist = float(np.linalg.norm(np.array(pos, dtype=np.float32) - ball_point))
+        if dist < best_dist:
+            best_dist = dist
+            best_id = player_id
+            best_team = team
+
+    if best_id is None or best_dist > max_possession_distance:
+        return None, None
+
+    return best_id, best_team
+
+
+def get_nearest_player_team(target_position, players_frame):
+    if target_position is None:
+        return None
+
+    player_distances = []
+    target_point = np.array(target_position, dtype=np.float32)
+
+    for _, player_data in players_frame.items():
+        player_position = player_data.get("field_pos")
+        player_team = player_data.get("team")
+        if player_position is None or player_team not in (1, 2):
+            continue
+
+        distance = float(np.linalg.norm(np.array(player_position, dtype=np.float32) - target_point))
+        player_distances.append((distance, player_team))
+
+    if not player_distances:
+        return None
+
+    player_distances.sort(key=lambda x: x[0])
+    nearest_three = player_distances[:3]
+
+    team_counts = {1: 0, 2: 0}
+    team_distance_sums = {1: 0.0, 2: 0.0}
+    for dist, team in nearest_three:
+        team_counts[team] += 1
+        team_distance_sums[team] += dist
+
+    if team_counts[1] > team_counts[2]:
+        return 1
+    if team_counts[2] > team_counts[1]:
+        return 2
+
+    return 1 if team_distance_sums[1] <= team_distance_sums[2] else 2
+
+
+def assign_goalkeeper_team_from_position(field_pos, field_center_x=52.5):
+    if field_pos is None:
+        return None
+    return 1 if float(field_pos[0]) < field_center_x else 2
+
+
+def get_team_assigner_choice():
+    """Prompt user to choose between TeamAssigner and CAETeamAssigner at runtime."""
+    print("\n" + "="*60)
+    print("TEAM ASSIGNMENT METHOD SELECTION")
+    print("="*60)
+    print("1. TeamAssigner (Color-based, traditional approach)")
+    print("2. CAETeamAssigner (Deep learning with CAE embeddings)")
+    print("="*60)
+    
+    while True:
+        choice = input("\nEnter your choice (1 or 2): ").strip()
+        if choice in ['1', '2']:
+            return int(choice)
+        print("Invalid choice. Please enter 1 or 2.")
+
+
 def main():
+    assigner_choice = get_team_assigner_choice()
+    
     with VideoProcessor('input_videos/CHEvsMCI.mp4') as video:
+        frames = []
+        for _, batch in video.get_batch_generator(batch_size=1):
+            frames.append(batch[0])
+
+        if not frames:
+            raise ValueError('No frames were loaded from the input video')
+
+        cam_estimator = Cam_Estimator(frames[0])
+        camera_movement_per_frame = cam_estimator.get_camera_movement(frames)
+
         p_tracker = Tracker('models/best.pt')
         k_tracker = KeypointsTracker('models/Keypoints_detection_best.pt', conf=0.3, kp_conf=0.5)
 
         def frame_gen():
-            video.reset()
-            for _, b in video.get_batch_generator(batch_size=1):
-                yield b[0]
+            for frame in frames:
+                yield frame
 
         p_tracks = p_tracker.get_object_tracks_chunked(frame_gen(), chunk_size=50)
 
-        video.reset()
         all_kpts = []
-        for _, batch in video.get_batch_generator(batch_size=10):
+        for start_idx in range(0, len(frames), 10):
+            batch = frames[start_idx:start_idx + 10]
             dets = k_tracker.detect(batch)
-            for d in dets: all_kpts.append(k_tracker.track(d))
+            for d in dets:
+                all_kpts.append(k_tracker.track(d))
 
         # --- Team Assignment ---
-        team_assigner = TeamAssigner()
-        # Collect player colors from multiple frames for robust team clustering
-        video.reset()
-        all_player_colors = []
-        max_init_frames = min(150, video.total_frames)
-        for batch_idx, batch in video.get_batch_generator(batch_size=1):
-            if batch_idx >= max_init_frames:
-                break
-            # Sample every 5th frame to get a diverse spread of players over time
-            if batch_idx % 5 != 0:
-                continue
-            frame = batch[0]
-            player_dets = p_tracks["players"][batch_idx]
-            for _, det in player_dets.items():
-                color = team_assigner.get_player_color(frame, det["bbox"])
-                if color is not None:
-                    all_player_colors.append(color)
+        if assigner_choice == 1:
+            team_assigner = TeamAssigner()
+            assigner_type = "TeamAssigner (Color-based)"
+            print(f"\n✓ Using {assigner_type}")
+        else:
+            team_assigner = CAETeamAssigner()
+            assigner_type = "CAETeamAssigner (Deep Learning)"
+            print(f"\n✓ Using {assigner_type}")
 
-        if len(all_player_colors) >= 2:
-            team_assigner.assign_team_color_from_colors(all_player_colors)
-            print(f"Team assignment initialized with {len(all_player_colors)} player color samples")
+        if isinstance(team_assigner, CAETeamAssigner):
+            bootstrap_ok = team_assigner.bootstrap_from_video(
+                frames,
+                p_tracks["players"],
+                sample_every=5,
+                max_frames=min(150, len(frames)),
+            )
+
+            if bootstrap_ok:
+                print(f"Team assignment initialized using CAE bootstrap in {team_assigner.assignment_mode} mode")
+            else:
+                print("WARNING: CAE bootstrap failed, falling back to color-based bootstrap")
+                all_player_colors = []
+                max_init_frames = min(150, len(frames))
+                for batch_idx, frame in enumerate(frames[:max_init_frames]):
+                    if batch_idx % 5 != 0:
+                        continue
+                    player_dets = p_tracks["players"][batch_idx]
+                    for _, det in player_dets.items():
+                        color = team_assigner.get_player_color(frame, det["bbox"])
+                        if color is not None:
+                            all_player_colors.append(color)
+
+                if len(all_player_colors) >= 2:
+                    team_assigner.assign_team_color_from_colors(all_player_colors)
+                    print(f"Team assignment initialized with {len(all_player_colors)} player color samples")
+                else:
+                    print("WARNING: Could not initialize team assignment - not enough player detections")
+        else:
+            all_player_colors = []
+            max_init_frames = min(150, len(frames))
+            for batch_idx, frame in enumerate(frames[:max_init_frames]):
+                if batch_idx % 5 != 0:
+                    continue
+                player_dets = p_tracks["players"][batch_idx]
+                for _, det in player_dets.items():
+                    color = team_assigner.get_player_color(frame, det["bbox"])
+                    if color is not None:
+                        all_player_colors.append(color)
+
+            if len(all_player_colors) >= 2:
+                team_assigner.assign_team_color_from_colors(all_player_colors)
+                print(f"Team assignment initialized with {len(all_player_colors)} player color samples")
+            else:
+                print("WARNING: Could not initialize team assignment - not enough player detections")
+
+        if 1 in team_assigner.team_colors and 2 in team_assigner.team_colors:
             print(f"Team 1 color: {team_assigner.team_colors[1]}")
             print(f"Team 2 color: {team_assigner.team_colors[2]}")
         else:
-            print("WARNING: Could not initialize team assignment - not enough player detections")
+            print("WARNING: Team colors were not initialized")
 
         view_transformer = ViewTransformer(alpha=0.5)
         possession_tracker = PossessionTracker(possession_radius=3.0, smoothing_window=5)
@@ -299,20 +459,26 @@ def main():
 
         final_tracks = {c: [] for c in ["players", "goalkeepers", "referees", "ball"]}
 
-        # We need the actual video frames for team colour extraction
-        video.reset()
-        frame_iter = iter(video.get_batch_generator(batch_size=1))
-
         KNOWN_MARKS = [(11.0, 34.0), (94.0, 34.0), (52.5, 34.0)] # penalty spots and center
 
         pass_detector = PassDetector()
         gk_detector = GoalkeeperDetector()
+        tackle_detector = TackleDetector(fps=video.fps)
+        card_detector = CardDetector(model_path='models/cards.pt')
         match_passes = []
-
+        match_tackles = []
+        match_cards = []
         for f_idx in range(video.total_frames):
-            # Get the current frame for colour-based team assignment
-            _, cur_batch = next(frame_iter)
-            cur_frame = cur_batch[0]
+            cur_frame = frames[f_idx]
+            camera_shift = camera_movement_per_frame[f_idx] if f_idx < len(camera_movement_per_frame) else (0, 0)
+
+            player_team_ids = {}
+            if isinstance(team_assigner, CAETeamAssigner):
+                player_team_ids = team_assigner.assign_teams_for_frame(
+                    cur_frame,
+                    p_tracks["players"][f_idx],
+                    frame_idx=f_idx,
+                )
 
             H = view_transformer.update(all_kpts[f_idx])
 
@@ -349,14 +515,28 @@ def main():
                             p_tracks["ball"][f_idx].pop(tid, None) # Remove from drawable tracks
                             continue # Skip adding to final_tracks for this frame
 
-                    safe_pos = filters[cat].update(tid, raw_pos)
+                    if raw_pos is not None:
+                        adjusted_raw_pos = np.array(
+                            [raw_pos[0] - camera_shift[0], raw_pos[1] - camera_shift[1]],
+                            dtype=np.float32,
+                        )
+                    else:
+                        adjusted_raw_pos = None
+
+                    safe_pos = filters[cat].update(tid, adjusted_raw_pos)
                     
                     entry = {"bbox": d["bbox"], "field_pos": safe_pos}
 
                     # Assign team for players only (goalkeepers keep default colour)
                     if cat == "players" and team_assigner.kmeans is not None:
-                        team_id = team_assigner.get_player_team(cur_frame, d["bbox"], tid)
+                        if isinstance(team_assigner, CAETeamAssigner):
+                            team_id = player_team_ids.get(tid, 1)
+                        else:
+                            team_id = team_assigner.get_player_team(cur_frame, d["bbox"], tid)
                         entry["team"] = team_id
+
+                    if cat == "goalkeepers":
+                        entry["team"] = assign_goalkeeper_team_from_position(safe_pos)
 
                     # Provide projection (metres) for speed estimation
                     if safe_pos is not None and cat in ("players", "goalkeepers", "ball"):
@@ -397,9 +577,49 @@ def main():
                 print(f"SUCCESS: Pass event detected: {pass_event}")
 
             # --- Possession update for this frame ---
-            possession_tracker.update(ball_pos, final_tracks["players"][-1])
+            possession_team = possession_tracker.update(ball_pos, final_tracks["players"][-1])
 
-        writer = VideoWriter('output_videos/CHEvsMCItest.mp4', video.width, video.height, video.fps)
+            # --- Tackle detection for this frame ---
+            # Prefer direct ball possessor from geometry, fallback to smoothed team estimate.
+            possessing_player_id, possessing_team_id = get_ball_possessor(ball_pos, final_tracks["players"][-1])
+            if possessing_player_id is None:
+                possessing_team_id = possession_team if possession_team in (1, 2) else None
+                if possessing_team_id in (1, 2):
+                    possessing_player_id = get_closest_player_id(ball_pos, final_tracks["players"][-1], possessing_team_id)
+            
+            tackle_events = tackle_detector.update(
+                frame_idx=f_idx,
+                players_frame=final_tracks["players"][-1],
+                possessing_player_id=possessing_player_id,
+                possessing_team_id=possessing_team_id,
+                frame_image=cur_frame,
+                ball_position=ball_pos,
+            )
+            for event in tackle_events:
+                match_tackles.append(event)
+                print(f"TACKLE: {event['status']} - Tackler P{event['tackler_id']} vs Victim P{event['victim_id']}")
+
+            # --- Card detection for this frame ---
+            players_for_cards = {}
+            for pid, pdata in final_tracks["players"][-1].items():
+                players_for_cards[pid] = {
+                    "bbox": pdata.get("bbox"),
+                    "team": pdata.get("team"),
+                }
+
+            card_events = card_detector.update(
+                frame=cur_frame,
+                players_in_frame=players_for_cards,
+                frame_index=f_idx,
+            )
+            for event in card_events:
+                match_cards.append(event)
+                print(
+                    f"CARD: {event['card_type'].upper()} for P{event['player_id']} "
+                    f"(Team {event.get('team')})"
+                )
+
+        writer = VideoWriter('output_videos/LIVvsRMAtest.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
@@ -410,9 +630,8 @@ def main():
         else:
             poss_colors = None
 
-        video.reset()
-        for f_idx, (_, batch) in enumerate(video.get_batch_generator(batch_size=1)):
-            annotated_frame = draw_combined_view(batch[0], final_tracks, all_kpts[f_idx], f_idx, p_tracker, team_colors=poss_colors)
+        for f_idx, frame in enumerate(frames):
+            annotated_frame = draw_combined_view(frame, final_tracks, all_kpts[f_idx], f_idx, p_tracker, team_colors=poss_colors)
             annotated_frame = possession_tracker.draw_possession_bar_at(
                 annotated_frame, f_idx, team_colors=poss_colors
             )
@@ -434,6 +653,59 @@ def main():
                 (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
                 cv2.rectangle(annotated_frame, (40, 40), (40 + tw + 20, 40 + th + 30), bg_color, -1)
                 cv2.putText(annotated_frame, text, (50, 40 + th + 15), cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
+
+            # --- Tackle Visualization Overlay ---
+            active_tackle = None
+            for t in match_tackles:
+                start_f = t.get("start_frame", 0)
+                end_f = t.get("end_frame", 0)
+                if start_f <= f_idx <= end_f + int(video.fps * 1.5):
+                    active_tackle = t
+                    break
+            
+            if active_tackle:
+                status_text = "SUCCESSFUL" if active_tackle['outcome'] == "success" else "FAILED"
+                foul_text = ""
+                if "is_foul_model" in active_tackle:
+                    foul_tag = "FOUL" if active_tackle["is_foul_model"] else "NO FOUL"
+                    foul_prob = active_tackle.get("foul_probability", 0.0)
+                    foul_text = f" | {foul_tag} ({foul_prob:.2f})"
+                text = f"{status_text} TACKLE: P{active_tackle['tackler_id']} vs P{active_tackle['victim_id']}{foul_text}"
+                bg_color = (0, 0, 0)
+                text_color = (0, 255, 0) if active_tackle['outcome'] == "success" else (0, 0, 255)
+                
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                # Position below the pass overlay to avoid overlap
+                y_offset = 40 if not active_pass else 120
+                cv2.rectangle(annotated_frame, (40, y_offset), (40 + tw + 20, y_offset + th + 30), bg_color, -1)
+                cv2.putText(annotated_frame, text, (50, y_offset + th + 15), cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
+
+            # --- Card Visualization Overlay ---
+            active_card = None
+            for c in match_cards:
+                if c.get("frame") == f_idx:
+                    active_card = c
+                    break
+
+            if active_card:
+                card_type = active_card.get("card_type", "").upper()
+                text = f"{card_type} CARD: P{active_card['player_id']}"
+                if active_card.get("team") in (1, 2):
+                    text += f" (Team {active_card['team']})"
+
+                bg_color = (0, 0, 0)
+                text_color = (0, 255, 255) if card_type == "YELLOW" else (0, 0, 255)
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+
+                y_offset = 200
+                if active_pass and active_tackle:
+                    y_offset = 280
+                elif active_pass or active_tackle:
+                    y_offset = 200
+
+                cv2.rectangle(annotated_frame, (40, y_offset), (40 + tw + 20, y_offset + th + 26), bg_color, -1)
+                cv2.putText(annotated_frame, text, (50, y_offset + th + 13), cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2)
+            
             writer.write(annotated_frame)
 
         writer.release()
@@ -442,6 +714,20 @@ def main():
         with open('passes.json', 'w') as f:
             json.dump(match_passes, f, indent=4)
         print(f"Successfully saved {len(match_passes)} pass events to passes.json")
+
+        # --- Save Tackles to JSON ---
+        with open('tackles.json', 'w') as f:
+            json.dump(match_tackles, f, indent=4)
+        print(f"Successfully saved {len(match_tackles)} tackle events to tackles.json")
+
+        # --- Save Cards to JSON ---
+        cards_output = {
+            "events": match_cards,
+            "summary": card_detector.get_summary(),
+        }
+        with open('cards.json', 'w') as f:
+            json.dump(cards_output, f, indent=4)
+        print(f"Successfully saved {len(match_cards)} card events to cards.json")
 
         t1_pct, t2_pct = possession_tracker.get_possession_percentages()
         print(f"SUCCESS: Ball now tracks properly on minimap and displays coordinates!")

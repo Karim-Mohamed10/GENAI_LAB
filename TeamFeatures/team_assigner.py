@@ -98,7 +98,7 @@ class TeamAssigner:
         if len(player_colors) < 2:
             return False
 
-        kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10)
+        kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10, random_state=42)
         kmeans.fit(player_colors)
 
         self.kmeans = kmeans
@@ -114,7 +114,7 @@ class TeamAssigner:
         if len(player_colors) < 2:
             return False
 
-        kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10)
+        kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10, random_state=42)
         kmeans.fit(player_colors)
 
         self.kmeans = kmeans
