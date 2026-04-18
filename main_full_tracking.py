@@ -18,7 +18,9 @@ import imageio
 import os
 import json
 import sys
-import draw_pass_maps
+import time
+import analytics.draw_pass_maps as draw_pass_maps
+import analytics.generate_heatmaps as generate_heatmaps
 
 #connecting keypoints 
 FIELD_CONNECTIONS = [
@@ -204,35 +206,6 @@ def draw_combined_view(frame, tracks, kpts, f_idx, tracker, team_colors=None):
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 255), 4)
             cv2.putText(annotated, f"BALL (P{tid})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
 
-    # # Draw coordinates
-    # for cat in ["players", "goalkeepers", "ball"]:
-    #     for tid, data in tracks[cat][f_idx].items():
-    #         if data.get("field_pos") is not None:
-    #             fx, fy = data["field_pos"]
-    #             lx, ly = int((data["bbox"][0] + data["bbox"][2]) / 2), int(data["bbox"][1]) - 10
-    #             label = f"({fx:.1f}, {fy:.1f})m"
-                
-    #             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                
-    #             # Make the ball text white, players cyan
-    #             txt_color = (255, 255, 255) if cat == "ball" else (0, 255, 255)
-                
-    #             cv2.rectangle(annotated, (lx - tw//2 - 2, ly - th - 2), (lx + tw//2 + 2, ly + 2), (0, 0, 0), -1)
-    #             cv2.putText(annotated, label, (lx - tw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, txt_color, 1)
-
-    # # Draw speed for players and goalkeepers
-    # for cat in ("players", "goalkeepers"):
-    #     for tid, data in tracks[cat][f_idx].items():
-    #         spd = data.get("speed")
-    #         if spd is None or data.get("bbox") is None:
-    #             continue
-    #         lx = int((data["bbox"][0] + data["bbox"][2]) / 2)
-    #         ly = int(data["bbox"][1]) - 26
-    #         spd_label = f"{spd:.1f} km/h"
-    #         (sw, sh), _ = cv2.getTextSize(spd_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-    #         cv2.rectangle(annotated, (lx - sw//2 - 2, ly - sh - 2), (lx + sw//2 + 2, ly + 2), (0, 0, 0), -1)
-    #         cv2.putText(annotated, spd_label, (lx - sw//2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
-
     m_map = draw_minimap(tracks, f_idx, team_colors)
 
     m_small = cv2.resize(m_map, (525, 340)) 
@@ -357,19 +330,26 @@ def get_team_assigner_choice():
 
 
 def main():
+    total_start_time = time.time()
     assigner_choice = get_team_assigner_choice()
     
-    with VideoProcessor('input_videos/CHEvsMCI.mp4') as video:
+    step_start_time = time.time()
+    print("Loading video frames...")
+    with VideoProcessor('input_videos/LIVvsARS.mp4') as video:
         frames = []
         for _, batch in video.get_batch_generator(batch_size=1):
             frames.append(batch[0])
 
         if not frames:
             raise ValueError('No frames were loaded from the input video')
+        print(f"[Timer] Video loading took {time.time() - step_start_time:.2f} seconds")
 
+        step_start_time = time.time()
         cam_estimator = Cam_Estimator(frames[0])
         camera_movement_per_frame = cam_estimator.get_camera_movement(frames)
+        print(f"[Timer] Camera estimation took {time.time() - step_start_time:.2f} seconds")
 
+        step_start_time = time.time()
         p_tracker = Tracker('models/best.pt')
         k_tracker = KeypointsTracker('models/Keypoints_detection_best.pt', conf=0.3, kp_conf=0.5)
 
@@ -378,14 +358,39 @@ def main():
                 yield frame
 
         p_tracks = p_tracker.get_object_tracks_chunked(frame_gen(), chunk_size=50)
+        print(f"[Timer] Object tracking took {time.time() - step_start_time:.2f} seconds")
 
+        step_start_time = time.time()
         all_kpts = []
         for start_idx in range(0, len(frames), 10):
             batch = frames[start_idx:start_idx + 10]
             dets = k_tracker.detect(batch)
             for d in dets:
                 all_kpts.append(k_tracker.track(d))
-
+        print(f"[Timer] Keypoints tracking took {time.time() - step_start_time:.2f} seconds")
+        
+        step_start_time = time.time()
+        # ============================================================
+        # NEW: 1. PRE-CLEAN PENALTY SPOTS & 2. INTERPOLATE THE BALL
+        # ============================================================
+        temp_view_transformer = ViewTransformer(alpha=0.5)
+        KNOWN_MARKS = [(11.0, 34.0), (94.0, 34.0), (52.5, 34.0)] 
+        
+        for f_idx in range(len(frames)):
+            H = temp_view_transformer.update(all_kpts[f_idx])
+            
+            for tid, d in list(p_tracks["ball"][f_idx].items()):
+                foot = get_foot_position(d["bbox"], is_ball=True)
+                raw_pos = transform_to_field_coords(foot, H)
+                
+                if raw_pos is not None:
+                    for mark in KNOWN_MARKS:
+                        if np.linalg.norm(np.array(raw_pos) - np.array(mark)) < 5.0:
+                            p_tracks["ball"][f_idx].pop(tid, None) # Delete the penalty spot!
+                            break
+        print(f"[Timer] Pre-cleaning penalty spots took {time.time() - step_start_time:.2f} seconds")
+        
+        step_start_time = time.time()
         # --- Team Assignment ---
         if assigner_choice == 1:
             team_assigner = TeamAssigner()
@@ -447,7 +452,9 @@ def main():
             print(f"Team 2 color: {team_assigner.team_colors[2]}")
         else:
             print("WARNING: Team colors were not initialized")
+        print(f"[Timer] Team assignment took {time.time() - step_start_time:.2f} seconds")
 
+        step_start_time = time.time()
         view_transformer = ViewTransformer(alpha=0.5)
         possession_tracker = PossessionTracker(possession_radius=1.2, smoothing_window=5)
         # field_pos is already in real-world metres so scale factors = 1.0
@@ -470,6 +477,7 @@ def main():
         match_passes = []
         match_tackles = []
         match_cards = []
+        team_positions = {"1": [], "2": []}
         for f_idx in range(video.total_frames):
             cur_frame = frames[f_idx]
             camera_shift = camera_movement_per_frame[f_idx] if f_idx < len(camera_movement_per_frame) else (0, 0)
@@ -503,19 +511,7 @@ def main():
                     foot = get_foot_position(d["bbox"], is_ball=is_ball)
                     raw_pos = transform_to_field_coords(foot, H)
 
-                    # --- Exclusion Zone Filter for Ball ---
-                    if cat == "ball" and raw_pos is not None:
-                        is_false_positive = False
-                        for mark in KNOWN_MARKS:
-                            dist = np.linalg.norm(np.array(raw_pos) - np.array(mark))
-                            if dist < 3.0:
-                                is_false_positive = True
-                                break
-                        
-                        if is_false_positive:
-                            raw_pos = None # Reject this position
-                            p_tracks["ball"][f_idx].pop(tid, None) # Remove from drawable tracks
-                            continue # Skip adding to final_tracks for this frame
+
 
                     # No need to adjust with optical flow pixel shifts.
                     safe_pos = filters[cat].update(tid, raw_pos)
@@ -613,8 +609,10 @@ def main():
                     f"CARD: {event['card_type'].upper()} for P{event['player_id']} "
                     f"(Team {event.get('team')})"
                 )
+        print(f"[Timer] Feature extraction loop took {time.time() - step_start_time:.2f} seconds")
 
-        writer = VideoWriter('output_videos/LIVvsRMAnew.mp4', video.width, video.height, video.fps)
+        step_start_time = time.time()
+        writer = VideoWriter('output_videos/LIVvsARS.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
@@ -700,37 +698,56 @@ def main():
 
                 cv2.rectangle(annotated_frame, (40, y_offset), (40 + tw + 20, y_offset + th + 26), bg_color, -1)
                 cv2.putText(annotated_frame, text, (50, y_offset + th + 13), cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2)
-            
+
+            for pid, pdata in final_tracks["players"][-1].items():
+                team_id = pdata.get("team")
+                pos = pdata.get("field_pos")
+                if team_id in (1, 2) and pos is not None:
+                    # Save the raw X, Y coordinates in meters
+                    team_positions[str(team_id)].append([float(pos[0]), float(pos[1])])
+    
             writer.write(annotated_frame)
 
         writer.release()
+        print(f"[Timer] Video rendering and writing took {time.time() - step_start_time:.2f} seconds")
         
+        step_start_time = time.time()
         # --- Save Passes to JSON ---
-        with open('passes.json', 'w') as f:
+        with open('exports/passes.json', 'w') as f:
             json.dump(match_passes, f, indent=4)
-        print(f"Successfully saved {len(match_passes)} pass events to passes.json")
+        print(f"Successfully saved {len(match_passes)} pass events to exports/passes.json")
 
         # --- Save Tackles to JSON ---
-        with open('tackles.json', 'w') as f:
+        with open('exports/tackles.json', 'w') as f:
             json.dump(match_tackles, f, indent=4)
-        print(f"Successfully saved {len(match_tackles)} tackle events to tackles.json")
+        print(f"Successfully saved {len(match_tackles)} tackle events to exports/tackles.json")
 
         # --- Save Cards to JSON ---
         cards_output = {
             "events": match_cards,
             "summary": card_detector.get_summary(),
         }
-        with open('cards.json', 'w') as f:
+        with open('exports/cards.json', 'w') as f:
             json.dump(cards_output, f, indent=4)
-        print(f"Successfully saved {len(match_cards)} card events to cards.json")
+        print(f"Successfully saved {len(match_cards)} card events to exports/cards.json")
+
+        # --- Save Team Positions to JSON ---
+        with open('exports/positions.json', 'w') as f:
+            json.dump(team_positions, f)
+        print(f"Successfully saved team positions to exports/positions.json")
 
         t1_pct, t2_pct = possession_tracker.get_possession_percentages()
         print(f"SUCCESS: Ball now tracks properly on minimap and displays coordinates!")
         print(f"Final Possession  —  Team 1: {t1_pct}%  |  Team 2: {t2_pct}%")
+        print(f"[Timer] JSON exports took {time.time() - step_start_time:.2f} seconds")
         
+        step_start_time = time.time()
         # --- Generate Pass Maps ---
         print("Generating pass maps")
         draw_pass_maps.main()
+        generate_heatmaps.main()
+        print(f"[Timer] Analytics generation took {time.time() - step_start_time:.2f} seconds")
+        print(f"[Timer] Total execution time: {time.time() - total_start_time:.2f} seconds")
 
 if __name__ == '__main__':
     main()

@@ -7,9 +7,10 @@ input_videos/
 output_videos/
 TeamFeatures/__pycache__/
 data/
-Exports/
 .vscode/
 __pycache__/
 runs/
-
 passes.json
+tackles.json
+training/football-ball-detection-4/
+exports/

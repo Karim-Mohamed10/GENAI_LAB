@@ -1,0 +1,6 @@
+{
+  "foul_decision_threshold": 0.47,
+  "metric": "val_f1",
+  "val_f1": 0.676605504587156,
+  "n_val_samples": 676
+}
