@@ -12,6 +12,7 @@ from TeamFeatures.pass_detector import PassDetector
 from TeamFeatures.goalkeeper_detector import GoalkeeperDetector
 from TeamFeatures.tackle_detector import TackleDetector
 from TeamFeatures.Card_Detector import CardDetector
+from TeamFeatures.shot_detector import ShotDetector
 import cv2
 import numpy as np
 import imageio
@@ -20,7 +21,9 @@ import json
 import sys
 import time
 import analytics.draw_pass_maps as draw_pass_maps
+import analytics.draw_shot_maps as draw_shot_maps
 import analytics.generate_heatmaps as generate_heatmaps
+
 
 #connecting keypoints 
 FIELD_CONNECTIONS = [
@@ -335,7 +338,7 @@ def main():
     
     step_start_time = time.time()
     print("Loading video frames...")
-    with VideoProcessor('input_videos/LIVvsARS.mp4') as video:
+    with VideoProcessor('input_videos/BURvsMUN.mp4') as video:
         frames = []
         for _, batch in video.get_batch_generator(batch_size=1):
             frames.append(batch[0])
@@ -456,7 +459,7 @@ def main():
 
         step_start_time = time.time()
         view_transformer = ViewTransformer(alpha=0.5)
-        possession_tracker = PossessionTracker(possession_radius=1.2, smoothing_window=5)
+        possession_tracker = PossessionTracker(possession_radius=1.5, smoothing_window=2)
         # field_pos is already in real-world metres so scale factors = 1.0
         speed_estimator = SpeedEstimator(field_width=105, field_height=68,
                                          real_field_length=105.0, real_field_width=68.0,
@@ -471,12 +474,14 @@ def main():
         KNOWN_MARKS = [(11.0, 34.0), (94.0, 34.0), (52.5, 34.0)] # penalty spots and center
 
         pass_detector = PassDetector()
+        shot_detector = ShotDetector()
         gk_detector = GoalkeeperDetector()
         tackle_detector = TackleDetector(fps=video.fps)
         card_detector = CardDetector(model_path='models/cards.pt')
         match_passes = []
         match_tackles = []
         match_cards = []
+        match_shots = []
         team_positions = {"1": [], "2": []}
         for f_idx in range(video.total_frames):
             cur_frame = frames[f_idx]
@@ -557,15 +562,30 @@ def main():
                 ball_pos, ball_speed, final_tracks["players"][-1], f_idx, video.fps
             )
 
-            # --- DEBUG: Tag the player the system thinks has the ball ---
-            if ball_pos is not None:
-                closest_id, _, best_dist = pass_detector._get_closest_player(ball_pos, final_tracks["players"][-1])
-                if closest_id is not None and best_dist <= pass_detector.possession_radius:
-                    if closest_id in final_tracks["players"][-1]:
-                        final_tracks["players"][-1][closest_id]["has_ball"] = True
+
+                # --- DEBUG: Tag the player the system thinks has the ball ---
+
+            sticky_player = possession_tracker.current_player
+            if sticky_player is not None:
+                if sticky_player in final_tracks["players"][-1]:
+                    final_tracks["players"][-1][sticky_player]["has_ball"] = True
+
             if pass_event is not None:
                 match_passes.append(pass_event)
                 print(f"SUCCESS: Pass event detected: {pass_event}")
+
+            # --- SHOT DETECTION ---
+            if ball_pos is not None and ball_speed is not None:
+                shot_event = shot_detector.update(
+                    ball_pos, 
+                    ball_speed, 
+                    possession_tracker.current_player,  # <--- Cleanly calling the Sticky Tracker again!
+                    possession_tracker.current_team, 
+                    f_idx
+                )
+                if shot_event:
+                    print(f" SHOT DETECTED: Player {shot_event['shooter_id']} -> {shot_event['outcome']}")
+                    match_shots.append(shot_event)
 
             # --- Possession update for this frame ---
             possession_team = possession_tracker.update(ball_pos, final_tracks["players"][-1])
@@ -612,7 +632,7 @@ def main():
         print(f"[Timer] Feature extraction loop took {time.time() - step_start_time:.2f} seconds")
 
         step_start_time = time.time()
-        writer = VideoWriter('output_videos/LIVvsARS.mp4', video.width, video.height, video.fps)
+        writer = VideoWriter('output_videos/BURvsMUN.mp4', video.width, video.height, video.fps)
 
         # Build BGR team colours for the possession bar (kmeans clusters are BGR)
         if team_assigner.kmeans is not None:
@@ -733,8 +753,12 @@ def main():
 
         # --- Save Team Positions to JSON ---
         with open('exports/positions.json', 'w') as f:
-            json.dump(team_positions, f)
+            json.dump(team_positions, f, indent=4)
         print(f"Successfully saved team positions to exports/positions.json")
+        
+        with open('exports/shots.json', 'w') as f:
+                json.dump(match_shots, f, indent=4)
+        print(f"Successfully saved {len(match_shots)} shot events to exports/shots.json")
 
         t1_pct, t2_pct = possession_tracker.get_possession_percentages()
         print(f"SUCCESS: Ball now tracks properly on minimap and displays coordinates!")
@@ -745,6 +769,7 @@ def main():
         # --- Generate Pass Maps ---
         print("Generating pass maps")
         draw_pass_maps.main()
+        draw_shot_maps.main()
         generate_heatmaps.main()
         print(f"[Timer] Analytics generation took {time.time() - step_start_time:.2f} seconds")
         print(f"[Timer] Total execution time: {time.time() - total_start_time:.2f} seconds")

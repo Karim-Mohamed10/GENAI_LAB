@@ -17,17 +17,14 @@ class PassDetector:
         self.initiator_id = None
         self.initiator_team = None
         self.pass_start_frame = None
+        
+        # --- NEW: Reception Buffer Variables ---
+        self.potential_receiver = None
+        self.receive_frames = 0
 
     def _get_closest_player(self, ball_pos, players):
         """
         Calculates the Euclidean distance between the ball and each player's field_pos.
-        
-        Args:
-            ball_pos: The (x, y) coordinates of the ball.
-            players: A dict mapping player_id to player data (which includes 'field_pos' and 'team').
-            
-        Returns:
-            tuple: (closest_id, closest_team, best_dist)
         """
         closest_id = None
         closest_team = None
@@ -68,6 +65,8 @@ class PassDetector:
                 self.current_possessor = None
                 self.current_team = None
                 self.possession_frames = 0
+                self.potential_receiver = None
+                self.receive_frames = 0
             else:
                 self.current_possessor = None
                 self.current_team = None
@@ -75,47 +74,67 @@ class PassDetector:
 
         elif self.state == "MOTION":
             
-            # FIX 1: Pass received by a DIFFERENT player (Catches one-touch and fast passes)
+            # FIX 1: The ball is near a NEW player. Start counting frames!
             if best_dist <= self.possession_radius and closest_id is not None and closest_id != self.initiator_id:
-                status = "COMPLETED" if closest_team == self.initiator_team else "INTERCEPTED"
                 
-                distance_meters = 0.0
-                if self.pass_start_pos is not None and ball_pos is not None:
-                    distance_meters = math.hypot(ball_pos[0] - self.pass_start_pos[0], ball_pos[1] - self.pass_start_pos[1])
+                if closest_id == self.potential_receiver:
+                    self.receive_frames += 1
+                else:
+                    self.potential_receiver = closest_id
+                    self.receive_frames = 1
                 
-                duration_seconds = 0.0
-                if self.pass_start_frame is not None and fps:
-                    duration_seconds = (frame_idx - self.pass_start_frame) / fps
+                # Only finalize the pass if they hold it for enough frames (Ignores 1-frame fly-bys)
+                if self.receive_frames >= self.min_possession_frames:
+                    status = "COMPLETED" if closest_team == self.initiator_team else "INTERCEPTED"
+                    
+                    distance_meters = 0.0
+                    if self.pass_start_pos is not None and ball_pos is not None:
+                        distance_meters = math.hypot(ball_pos[0] - self.pass_start_pos[0], ball_pos[1] - self.pass_start_pos[1])
+                    
+                    duration_seconds = 0.0
+                    if self.pass_start_frame is not None and fps:
+                        duration_seconds = (frame_idx - self.pass_start_frame) / fps
 
-                event = {
-                    "event_type": "PASS",
-                    "status": status,
-                    "initiator_id": int(self.initiator_id) if self.initiator_id is not None else None,
-                    "initiator_team": int(self.initiator_team) if self.initiator_team is not None else None,
-                    "receiver_id": int(closest_id) if closest_id is not None else None,
-                    "receiver_team": int(closest_team) if closest_team is not None else None,
-                    "start_pos": [float(x) for x in self.pass_start_pos] if self.pass_start_pos is not None else None,
-                    "end_pos": [float(x) for x in ball_pos] if ball_pos is not None else None,
-                    "distance_meters": round(float(distance_meters), 2),
-                    "duration_seconds": round(float(duration_seconds), 2),
-                    "start_frame": int(self.pass_start_frame) if self.pass_start_frame is not None else None,
-                    "end_frame": int(frame_idx)
-                }
+                    event = {
+                        "event_type": "PASS",
+                        "status": status,
+                        "initiator_id": int(self.initiator_id) if self.initiator_id is not None else None,
+                        "initiator_team": int(self.initiator_team) if self.initiator_team is not None else None,
+                        "receiver_id": int(closest_id) if closest_id is not None else None,
+                        "receiver_team": int(closest_team) if closest_team is not None else None,
+                        "start_pos": [float(x) for x in self.pass_start_pos] if self.pass_start_pos is not None else None,
+                        "end_pos": [float(x) for x in ball_pos] if ball_pos is not None else None,
+                        "distance_meters": round(float(distance_meters), 2),
+                        "duration_seconds": round(float(duration_seconds), 2),
+                        "start_frame": int(self.pass_start_frame) if self.pass_start_frame is not None else None,
+                        "end_frame": int(frame_idx)
+                    }
 
-                self.state = "POSSESSION"
-                self.current_possessor = closest_id
-                self.current_team = closest_team
-                self.possession_frames = 1
-                
-                return event
-
+                    self.state = "POSSESSION"
+                    self.current_possessor = closest_id
+                    self.current_team = closest_team
+                    self.possession_frames = self.receive_frames
+                    
+                    # Clean up
+                    self.potential_receiver = None
+                    self.receive_frames = 0
+                    
+                    return event
+            
             # FIX 2: Player passes to himself / Knock-on dribble (Silently reset)
             elif best_dist <= self.possession_radius and closest_id == self.initiator_id and ball_speed is not None and ball_speed < self.kick_speed_threshold:
                 self.state = "POSSESSION"
                 self.current_possessor = closest_id
                 self.current_team = closest_team
                 self.possession_frames = 1
+                self.potential_receiver = None
+                self.receive_frames = 0
                 return None
+                
+            else:
+                # If the ball flies away from the potential receiver before hitting the threshold, 
+                # reset the buffer. It was just a fly-by!
+                self.potential_receiver = None
+                self.receive_frames = 0
 
         return None
-
